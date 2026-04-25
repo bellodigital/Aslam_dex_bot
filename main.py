@@ -490,3 +490,73 @@ def scanner_loop():
 # ----------------------------------------------------------------------
 # Flask Server
 # -------------------------------------------------------------
+app = Flask(__name__)
+
+@app.route("/")
+def status():
+    with trade_lock:
+        trades_list = [{
+            "token": t["token"],
+            "address": addr,
+            "entry_price": t["entry_price"],
+            "highest_price": t.get("highest_price", 0),
+            "age_min": round((time.time() - t["timestamp"]) / 60, 1)
+        } for addr, t in active_trades.items()]
+    return jsonify({
+        "status": "running",
+        "paper_mode": PAPER_MODE,
+        "active_trades": len(active_trades),
+        "trades": trades_list,
+        "cycles": scan_cycle_count,
+        "server_time": datetime.now(timezone.utc).isoformat(),
+    })
+
+@app.route("/debug")
+def debug():
+    with trade_lock:
+        trades = []
+        for addr, t in active_trades.items():
+            try:
+                current_price = fetch_pair_price(t["pair_address"])
+                pnl_pct = ((current_price - t["entry_price"]) / t["entry_price"]) * 100 if current_price else None
+                profit_from_high = ((t.get("highest_price", t["entry_price"]) - t["entry_price"]) / t["entry_price"]) * 100
+            except:
+                current_price = None
+                pnl_pct = None
+                profit_from_high = None
+            trades.append({
+                "token": t["token"],
+                "entry": t["entry_price"],
+                "current": current_price,
+                "highest": t.get("highest_price", 0),
+                "pnl_pct": round(pnl_pct, 2) if pnl_pct else None,
+                "profit_from_high": round(profit_from_high, 2) if profit_from_high else None,
+                "age_min": round((time.time() - t["timestamp"]) / 60, 1)
+            })
+    return jsonify({"trades": trades, "cooldowns": len(recent)})
+
+def start_flask():
+    port = int(os.getenv("PORT", "8080"))
+    logger.info(f"Flask on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+# ----------------------------------------------------------------------
+# Entry Point
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    if not DISCORD_WEBHOOK_URL:
+        logger.warning("DISCORD_WEBHOOK_URL not set")
+
+    # Flask
+    flask_thread = threading.Thread(target=start_flask, daemon=True)
+    flask_thread.start()
+    time.sleep(3)  # Extra time for Flask to fully bind
+
+    # Fast monitor
+    monitor_thread = threading.Thread(target=fast_monitor_loop, daemon=True)
+    monitor_thread.start()
+    logger.info("Fast monitor thread launched")
+
+    # Main scanner
+    scanner_loop()
+```
