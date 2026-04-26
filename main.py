@@ -26,39 +26,38 @@ logger = logging.getLogger("scalper")
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-# Multi‑chain support: comma‑separated list (e.g. "bsc,ethereum,base,solana")
 TARGET_CHAINS = [c.strip().lower() for c in os.getenv("TARGET_CHAINS", "bsc,ethereum,base,solana").split(",") if c.strip()]
 
 MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "1.0"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-3.0"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "3.0"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-1.5"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "2.0"))
 TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "true").lower() == "true"
-TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "1.5"))
-TRAILING_DISTANCE_PCT = float(os.getenv("TRAILING_DISTANCE_PCT", "1.0"))
-MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "0"))
+TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "1.0"))
+TRAILING_DISTANCE_PCT = float(os.getenv("TRAILING_DISTANCE_PCT", "0.5"))
+MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "0"))          # 0 = disabled, or set e.g. 10
 PULLBACK_ENTRY_PCT = float(os.getenv("PULLBACK_ENTRY_PCT", "0.5"))
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.3"))
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "10000.0"))
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", "5000.0"))
-MIN_CHANGE = float(os.getenv("MIN_CHANGE", "1.0"))   # relaxed for multi‑chain
+
+# Higher default filters – avoid thinly traded tokens
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "50000.0"))         # was 10000
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "25000.0"))               # was 5000
+MIN_CHANGE = float(os.getenv("MIN_CHANGE", "1.0"))
 MIN_AGE_HOURS = float(os.getenv("MIN_AGE_HOURS", "0.0"))
 MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "1e-8"))
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 
-# Map DexScreener chainId → GoPlus numeric chain ID
+# Monitor interval – faster to catch SL accurately
+FAST_MONITOR_INTERVAL = int(os.getenv("FAST_MONITOR_INTERVAL", "5"))  # seconds
+
+# Blacklist after stop loss (hours)
+BLACKLIST_AFTER_SL_HOURS = float(os.getenv("BLACKLIST_AFTER_SL_HOURS", "3.0"))
+
 CHAIN_ID_MAP = {
-    "bsc": 56,
-    "ethereum": 1,
-    "polygon": 137,
-    "avalanche": 43114,
-    "fantom": 250,
-    "arbitrum": 42161,
-    "optimism": 10,
-    "base": 8453,
-    "solana": 101,          # Solana support
+    "bsc": 56, "ethereum": 1, "polygon": 137, "avalanche": 43114,
+    "fantom": 250, "arbitrum": 42161, "optimism": 10, "base": 8453,
+    "solana": 101,
 }
 
-# Search terms (fallback)
 SEARCH_TERMS = [
     "pepe", "shib", "doge", "elon", "floki", "moon",
     "inu", "baby", "pump", "king", "rocket", "cat",
@@ -72,6 +71,9 @@ active_trades: Dict[str, dict] = {}
 recent: Dict[str, float] = {}
 trade_lock = threading.Lock()
 scan_cycle_count = 0
+
+# Blacklist tracking: token_addr -> timestamp of stop loss
+stop_loss_blacklist: Dict[str, float] = {}
 
 # ----------------------------------------------------------------------
 # Discord Alerts
@@ -134,7 +136,6 @@ def fetch_dex_pairs(query: str) -> List[dict]:
         return []
 
 def fetch_pair_price(chain: str, pair_address: str) -> Optional[float]:
-    """Fetch current price for a pair on a given chain."""
     url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_address}"
     try:
         resp = requests.get(url, timeout=5)
@@ -147,7 +148,7 @@ def fetch_pair_price(chain: str, pair_address: str) -> Optional[float]:
     return None
 
 # ----------------------------------------------------------------------
-# Filtering
+# Filtering (with extra pullback safety)
 # ----------------------------------------------------------------------
 def filter_pairs(pairs: List[dict]) -> List[dict]:
     now_ms = int(time.time() * 1000)
@@ -163,6 +164,8 @@ def filter_pairs(pairs: List[dict]) -> List[dict]:
             liq = float(pair.get("liquidity", {}).get("usd", 0))
             vol = float(pair.get("volume", {}).get("h24", 0))
             m5 = float(pair.get("priceChange", {}).get("m5", 0))
+            # Also get 1-minute change for pullback safety
+            m1 = float(pair.get("priceChange", {}).get("m1", 0))  # may be 0 if not available
             created = int(pair.get("pairCreatedAt", 0))
             age_hours = (now_ms - created) / 3600000 if created else 0
             if liq < MIN_LIQUIDITY or vol < MIN_VOLUME or m5 < MIN_CHANGE:
@@ -172,9 +175,10 @@ def filter_pairs(pairs: List[dict]) -> List[dict]:
             pair["_liq"] = liq
             pair["_vol"] = vol
             pair["_m5"] = m5
+            pair["_m1"] = m1
             pair["_age_hours"] = age_hours
             pair["_price"] = price
-            pair["_chain"] = chain   # store chain for later
+            pair["_chain"] = chain
             valid.append(pair)
         except Exception as e:
             logger.debug(f"Filter error: {e}")
@@ -182,12 +186,20 @@ def filter_pairs(pairs: List[dict]) -> List[dict]:
     return valid
 
 def is_pullback_entry(pair: dict) -> bool:
+    """
+    Allow entry only if price has pulled back from 5-min high AND
+    the 1-minute change is not strongly negative (not in free fall).
+    """
     if PULLBACK_ENTRY_PCT <= 0:
         return True
     try:
-        price = pair.get("_price", float(pair.get("priceUsd", 0)))
+        price = pair.get("_price", 0)
         m5 = pair.get("_m5", 0)
+        m1 = pair.get("_m1", 0)  # 1-minute change
         if m5 <= 0:
+            return False
+        # 1-minute drop > 2% is a red flag – still falling, avoid
+        if m1 < -2.0:
             return False
         estimated_high = price / (1 + m5 / 100)
         pullback_target = estimated_high * (1 - PULLBACK_ENTRY_PCT / 100)
@@ -235,6 +247,31 @@ def calculate_pair_score(pair: dict, is_safe: bool) -> float:
         return 0.0
 
 # ----------------------------------------------------------------------
+# Blacklist Management
+# ----------------------------------------------------------------------
+def is_blacklisted(token_addr: str) -> bool:
+    """Check if token has been blacklisted after a recent stop loss."""
+    if token_addr in stop_loss_blacklist:
+        elapsed_hours = (time.time() - stop_loss_blacklist[token_addr]) / 3600
+        if elapsed_hours < BLACKLIST_AFTER_SL_HOURS:
+            return True
+        else:
+            # expired
+            del stop_loss_blacklist[token_addr]
+    return False
+
+def add_to_blacklist(token_addr: str):
+    """Add token to blacklist after a stop loss."""
+    stop_loss_blacklist[token_addr] = time.time()
+
+def clean_blacklist():
+    """Remove expired entries."""
+    now = time.time()
+    expired = [addr for addr, ts in stop_loss_blacklist.items() if (now - ts) / 3600 >= BLACKLIST_AFTER_SL_HOURS]
+    for addr in expired:
+        del stop_loss_blacklist[addr]
+
+# ----------------------------------------------------------------------
 # Paper Trading - Entry
 # ----------------------------------------------------------------------
 def simulate_buy(pair: dict) -> Optional[dict]:
@@ -246,10 +283,17 @@ def simulate_buy(pair: dict) -> Optional[dict]:
 
     now = time.time()
     with trade_lock:
+        # Cooldown check
         if token_addr in recent and (now - recent[token_addr]) < 1800:
             return None
+        # Already holding
         if token_addr in active_trades:
             return None
+        # Blacklist check
+        if is_blacklisted(token_addr):
+            logger.info(f"Token {token_addr} is blacklisted after stop loss, skipping")
+            return None
+
         try:
             price = pair.get("_price", float(pair.get("priceUsd", 0)))
             if price <= 0:
@@ -262,7 +306,7 @@ def simulate_buy(pair: dict) -> Optional[dict]:
                 "token": pair["baseToken"]["symbol"],
                 "token_address": token_addr,
                 "pair_address": pair_addr,
-                "chain": chain,                 # store chain
+                "chain": chain,
                 "entry_price": entry_price,
                 "amount_usd": trade_usd,
                 "quantity": quantity,
@@ -279,7 +323,7 @@ def simulate_buy(pair: dict) -> Optional[dict]:
             return None
 
 # ----------------------------------------------------------------------
-# Fast Monitoring
+# Fast Monitoring (interval now configurable, default 5s)
 # ----------------------------------------------------------------------
 def monitor_positions_fast() -> List[dict]:
     closed = []
@@ -334,6 +378,12 @@ def monitor_positions_fast() -> List[dict]:
                         closed_trade["quantity"] * current_price - closed_trade["amount_usd"], 2
                     )
                     closed.append(closed_trade)
+
+                    # If stop loss, add to blacklist
+                    if exit_reason == "STOP_LOSS":
+                        add_to_blacklist(token_addr)
+                        logger.info(f"Blacklisted {token_addr} for {BLACKLIST_AFTER_SL_HOURS}h after SL")
+
                     logger.info(f"{exit_reason}: {closed_trade['token']} at {pct_change:.2f}%")
         except Exception as e:
             logger.error(f"Fast monitor error for {trade.get('token','')}: {e}")
@@ -342,7 +392,7 @@ def monitor_positions_fast() -> List[dict]:
     return closed
 
 def fast_monitor_loop():
-    logger.info("Fast monitor thread started (15s interval)")
+    logger.info(f"Fast monitor thread started ({FAST_MONITOR_INTERVAL}s interval)")
     while True:
         try:
             closed = monitor_positions_fast()
@@ -365,19 +415,7 @@ def fast_monitor_loop():
                 send_discord_alert(f"Paper {reason.lower()} executed", embed)
         except Exception as e:
             logger.error(f"Fast monitor loop error: {e}")
-        time.sleep(15)
-
-# ----------------------------------------------------------------------
-# Memory Cleanup
-# ----------------------------------------------------------------------
-def clean_memory():
-    now = time.time()
-    with trade_lock:
-        stale = [addr for addr, ts in recent.items() if now - ts > 1800]
-        for addr in stale:
-            del recent[addr]
-        if stale:
-            logger.debug(f"Cleaned {len(stale)} old cooldown entries")
+        time.sleep(FAST_MONITOR_INTERVAL)
 
 # ----------------------------------------------------------------------
 # Main Scanner Loop
@@ -385,12 +423,12 @@ def clean_memory():
 def scanner_loop():
     global scan_cycle_count
     logger.info("=" * 50)
-    logger.info("SCALPER BOT STARTED (v5 - Multi-Chain)")
+    logger.info("SCALPER BOT STARTED (v6 - Safer Scalping)")
     logger.info(f"Paper Mode: {PAPER_MODE}, Target chains: {TARGET_CHAINS}")
+    logger.info(f"Filters: Liq>${MIN_LIQUIDITY}, Vol>${MIN_VOLUME}, m5>{MIN_CHANGE}%")
     logger.info(f"Trade Size: ${MAX_TRADE_SIZE}, SL: {STOP_LOSS_PCT}%, TP: {TAKE_PROFIT_PCT}%")
-    logger.info(f"Trailing: {TRAILING_STOP_ENABLED} (activate at +{TRAILING_ACTIVATION_PCT}%, distance {TRAILING_DISTANCE_PCT}%)")
-    logger.info(f"Pullback Entry: {PULLBACK_ENTRY_PCT}% below 5-min high")
-    logger.info(f"Slippage: {SLIPPAGE_PCT}%, Max Hold: {MAX_HOLD_MINUTES} min, Scan Interval: {SCAN_INTERVAL_SECONDS}s")
+    logger.info(f"Trailing: {TRAILING_STOP_ENABLED} (activate +{TRAILING_ACTIVATION_PCT}%, distance {TRAILING_DISTANCE_PCT}%)")
+    logger.info(f"Blacklist after SL: {BLACKLIST_AFTER_SL_HOURS}h, Monitor interval: {FAST_MONITOR_INTERVAL}s")
     logger.info("=" * 50)
 
     last_clean = time.time()
@@ -402,10 +440,9 @@ def scanner_loop():
             # 1. Boosts API
             boosted = fetch_boosted_tokens("latest")
             if boosted:
-                # Accept any chain that's in our TARGET_CHAINS
                 chain_boosted = [b for b in boosted if b.get("chainId") in TARGET_CHAINS]
                 logger.info(f"Boosts: {len(chain_boosted)} tokens on {TARGET_CHAINS}")
-                for b in chain_boosted[:20]:   # slightly more candidates
+                for b in chain_boosted[:20]:
                     token_addr = b.get("tokenAddress")
                     if token_addr:
                         pair = fetch_pair_by_address(token_addr)
@@ -444,13 +481,13 @@ def scanner_loop():
                     break
             logger.info(f"Top momentum tokens: {len(top_pairs)}")
 
-            # 4. Security & Trade
+                 # 4. Security & Trade
             for pair in top_pairs:
                 token_addr = pair["baseToken"]["address"]
                 chain = pair.get("_chain", pair.get("chainId"))
                 numeric_chain = CHAIN_ID_MAP.get(chain)
                 if numeric_chain is None:
-                    continue   # skip chains we can't check
+                    continue
 
                 security = get_token_security(numeric_chain, token_addr)
                 safe = is_token_safe(security)
@@ -477,12 +514,13 @@ def scanner_loop():
                     }
                     send_discord_alert("New paper trade entered", embed)
 
-            # 5. Memory Cleanup
+            # 5. Cleanup
             if time.time() - last_clean > 600:
                 clean_memory()
+                clean_blacklist()
                 last_clean = time.time()
 
-            # 6. Status log
+            # 6. Status
             if scan_cycle_count % 5 == 0:
                 with trade_lock:
                     open_count = len(active_trades)
@@ -493,6 +531,15 @@ def scanner_loop():
         except Exception as e:
             logger.error(f"Main loop error: {e}", exc_info=True)
             time.sleep(30)
+
+def clean_memory():
+    now = time.time()
+    with trade_lock:
+        stale = [addr for addr, ts in recent.items() if now - ts > 1800]
+        for addr in stale:
+            del recent[addr]
+        if stale:
+            logger.debug(f"Cleaned {len(stale)} old cooldown entries")
 
 # ----------------------------------------------------------------------
 # Flask Server
@@ -523,6 +570,7 @@ def status():
         "active_trades": len(active_trades),
         "trades": trades_list,
         "cycles": scan_cycle_count,
+        "blacklist_count": len(stop_loss_blacklist),
         "server_time": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -550,7 +598,7 @@ def debug():
                 "profit_from_high": round(profit_from_high, 2) if profit_from_high else None,
                 "age_min": round((time.time() - t["timestamp"]) / 60, 1)
             })
-    return jsonify({"trades": trades, "cooldowns": len(recent)})
+    return jsonify({"trades": trades, "blacklist": list(stop_loss_blacklist.keys())})
 
 # ----------------------------------------------------------------------
 # Entry Point
@@ -559,12 +607,12 @@ if __name__ == "__main__":
     if not DISCORD_WEBHOOK_URL:
         logger.warning("DISCORD_WEBHOOK_URL not set")
 
-    # Start fast monitor
+    # Fast monitor
     monitor_thread = threading.Thread(target=fast_monitor_loop, daemon=True)
     monitor_thread.start()
     logger.info("Fast monitor thread launched")
 
-    # Start scanner
+    # Scanner
     scanner_thread = threading.Thread(target=scanner_loop, daemon=True)
     scanner_thread.start()
     logger.info("Scanner thread launched")
@@ -573,5 +621,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     logger.info(f"Flask on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
-
+                 
