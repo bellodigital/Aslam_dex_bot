@@ -30,26 +30,22 @@ TARGET_CHAINS = [c.strip().lower() for c in os.getenv("TARGET_CHAINS", "bsc,ethe
 
 MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "1.0"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-1.5"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "2.0"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "3.0"))
 TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "true").lower() == "true"
-TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "1.0"))
-TRAILING_DISTANCE_PCT = float(os.getenv("TRAILING_DISTANCE_PCT", "0.5"))
-MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "0"))          # 0 = disabled, or set e.g. 10
+TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "2.0"))
+TRAILING_DISTANCE_PCT = float(os.getenv("TRAILING_DISTANCE_PCT", "1.0"))
+MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "0"))          # 0 = disabled
 PULLBACK_ENTRY_PCT = float(os.getenv("PULLBACK_ENTRY_PCT", "0.5"))
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.3"))
 
-# Higher default filters – avoid thinly traded tokens
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "50000.0"))         # was 10000
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", "25000.0"))               # was 5000
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "20000.0"))
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "10000.0"))
 MIN_CHANGE = float(os.getenv("MIN_CHANGE", "1.0"))
 MIN_AGE_HOURS = float(os.getenv("MIN_AGE_HOURS", "0.0"))
-MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "1e-8"))
+MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "0.0001"))          # increased to filter dust
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
+FAST_MONITOR_INTERVAL = int(os.getenv("FAST_MONITOR_INTERVAL", "5"))
 
-# Monitor interval – faster to catch SL accurately
-FAST_MONITOR_INTERVAL = int(os.getenv("FAST_MONITOR_INTERVAL", "5"))  # seconds
-
-# Blacklist after stop loss (hours)
 BLACKLIST_AFTER_SL_HOURS = float(os.getenv("BLACKLIST_AFTER_SL_HOURS", "3.0"))
 
 CHAIN_ID_MAP = {
@@ -72,7 +68,6 @@ recent: Dict[str, float] = {}
 trade_lock = threading.Lock()
 scan_cycle_count = 0
 
-# Blacklist tracking: token_addr -> timestamp of stop loss
 stop_loss_blacklist: Dict[str, float] = {}
 
 # ----------------------------------------------------------------------
@@ -148,7 +143,7 @@ def fetch_pair_price(chain: str, pair_address: str) -> Optional[float]:
     return None
 
 # ----------------------------------------------------------------------
-# Filtering (with extra pullback safety)
+# Filtering
 # ----------------------------------------------------------------------
 def filter_pairs(pairs: List[dict]) -> List[dict]:
     now_ms = int(time.time() * 1000)
@@ -164,8 +159,7 @@ def filter_pairs(pairs: List[dict]) -> List[dict]:
             liq = float(pair.get("liquidity", {}).get("usd", 0))
             vol = float(pair.get("volume", {}).get("h24", 0))
             m5 = float(pair.get("priceChange", {}).get("m5", 0))
-            # Also get 1-minute change for pullback safety
-            m1 = float(pair.get("priceChange", {}).get("m1", 0))  # may be 0 if not available
+            m1 = float(pair.get("priceChange", {}).get("m1", 0))
             created = int(pair.get("pairCreatedAt", 0))
             age_hours = (now_ms - created) / 3600000 if created else 0
             if liq < MIN_LIQUIDITY or vol < MIN_VOLUME or m5 < MIN_CHANGE:
@@ -186,19 +180,14 @@ def filter_pairs(pairs: List[dict]) -> List[dict]:
     return valid
 
 def is_pullback_entry(pair: dict) -> bool:
-    """
-    Allow entry only if price has pulled back from 5-min high AND
-    the 1-minute change is not strongly negative (not in free fall).
-    """
     if PULLBACK_ENTRY_PCT <= 0:
         return True
     try:
         price = pair.get("_price", 0)
         m5 = pair.get("_m5", 0)
-        m1 = pair.get("_m1", 0)  # 1-minute change
+        m1 = pair.get("_m1", 0)
         if m5 <= 0:
             return False
-        # 1-minute drop > 2% is a red flag – still falling, avoid
         if m1 < -2.0:
             return False
         estimated_high = price / (1 + m5 / 100)
@@ -250,22 +239,18 @@ def calculate_pair_score(pair: dict, is_safe: bool) -> float:
 # Blacklist Management
 # ----------------------------------------------------------------------
 def is_blacklisted(token_addr: str) -> bool:
-    """Check if token has been blacklisted after a recent stop loss."""
     if token_addr in stop_loss_blacklist:
         elapsed_hours = (time.time() - stop_loss_blacklist[token_addr]) / 3600
         if elapsed_hours < BLACKLIST_AFTER_SL_HOURS:
             return True
         else:
-            # expired
             del stop_loss_blacklist[token_addr]
     return False
 
 def add_to_blacklist(token_addr: str):
-    """Add token to blacklist after a stop loss."""
     stop_loss_blacklist[token_addr] = time.time()
 
 def clean_blacklist():
-    """Remove expired entries."""
     now = time.time()
     expired = [addr for addr, ts in stop_loss_blacklist.items() if (now - ts) / 3600 >= BLACKLIST_AFTER_SL_HOURS]
     for addr in expired:
@@ -283,13 +268,10 @@ def simulate_buy(pair: dict) -> Optional[dict]:
 
     now = time.time()
     with trade_lock:
-        # Cooldown check
         if token_addr in recent and (now - recent[token_addr]) < 1800:
             return None
-        # Already holding
         if token_addr in active_trades:
             return None
-        # Blacklist check
         if is_blacklisted(token_addr):
             logger.info(f"Token {token_addr} is blacklisted after stop loss, skipping")
             return None
@@ -323,7 +305,7 @@ def simulate_buy(pair: dict) -> Optional[dict]:
             return None
 
 # ----------------------------------------------------------------------
-# Fast Monitoring (interval now configurable, default 5s)
+# Fast Monitoring
 # ----------------------------------------------------------------------
 def monitor_positions_fast() -> List[dict]:
     closed = []
@@ -379,7 +361,6 @@ def monitor_positions_fast() -> List[dict]:
                     )
                     closed.append(closed_trade)
 
-                    # If stop loss, add to blacklist
                     if exit_reason == "STOP_LOSS":
                         add_to_blacklist(token_addr)
                         logger.info(f"Blacklisted {token_addr} for {BLACKLIST_AFTER_SL_HOURS}h after SL")
@@ -425,7 +406,7 @@ def scanner_loop():
     logger.info("=" * 50)
     logger.info("SCALPER BOT STARTED (v6 - Safer Scalping)")
     logger.info(f"Paper Mode: {PAPER_MODE}, Target chains: {TARGET_CHAINS}")
-    logger.info(f"Filters: Liq>${MIN_LIQUIDITY}, Vol>${MIN_VOLUME}, m5>{MIN_CHANGE}%")
+    logger.info(f"Filters: Liq>${MIN_LIQUIDITY}, Vol>${MIN_VOLUME}, m5>{MIN_CHANGE}%, Price>${MIN_PRICE_USD}")
     logger.info(f"Trade Size: ${MAX_TRADE_SIZE}, SL: {STOP_LOSS_PCT}%, TP: {TAKE_PROFIT_PCT}%")
     logger.info(f"Trailing: {TRAILING_STOP_ENABLED} (activate +{TRAILING_ACTIVATION_PCT}%, distance {TRAILING_DISTANCE_PCT}%)")
     logger.info(f"Blacklist after SL: {BLACKLIST_AFTER_SL_HOURS}h, Monitor interval: {FAST_MONITOR_INTERVAL}s")
@@ -481,7 +462,7 @@ def scanner_loop():
                     break
             logger.info(f"Top momentum tokens: {len(top_pairs)}")
 
-                 # 4. Security & Trade
+            # 4. Security & Trade
             for pair in top_pairs:
                 token_addr = pair["baseToken"]["address"]
                 chain = pair.get("_chain", pair.get("chainId"))
@@ -621,4 +602,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     logger.info(f"Flask on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-                 
