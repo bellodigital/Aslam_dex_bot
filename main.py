@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger("scalper")
 
 # ----------------------------------------------------------------------
-# Configuration
+# Configuration (relaxed defaults to let tokens through)
 # ----------------------------------------------------------------------
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -38,11 +38,12 @@ MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "0"))
 PULLBACK_ENTRY_PCT = float(os.getenv("PULLBACK_ENTRY_PCT", "0"))
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.3"))
 
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "20000.0"))
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", "10000.0"))
-MIN_CHANGE = float(os.getenv("MIN_CHANGE", "1.0"))
+# Relaxed filter defaults – can be raised via Render variables later
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "5000.0"))
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "2000.0"))
+MIN_CHANGE = float(os.getenv("MIN_CHANGE", "0.5"))
 MIN_AGE_HOURS = float(os.getenv("MIN_AGE_HOURS", "0.0"))
-MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "0.0005"))          # raised to filter dust
+MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "0.00001"))
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 FAST_MONITOR_INTERVAL = int(os.getenv("FAST_MONITOR_INTERVAL", "5"))
 
@@ -144,7 +145,7 @@ def fetch_pair_price(chain: str, pair_address: str) -> Optional[float]:
     return None
 
 # ----------------------------------------------------------------------
-# Filtering
+# Filtering (with diagnostic log)
 # ----------------------------------------------------------------------
 def filter_pairs(pairs: List[dict]) -> List[dict]:
     now_ms = int(time.time() * 1000)
@@ -178,6 +179,9 @@ def filter_pairs(pairs: List[dict]) -> List[dict]:
         except Exception as e:
             logger.debug(f"Filter error: {e}")
             continue
+
+    # Diagnostic: how many tokens passed the basic filters?
+    logger.info(f"Filter summary: {len(pairs)} input, {len(valid)} passed for chains {TARGET_CHAINS}")
     return valid
 
 def is_pullback_entry(pair: dict) -> bool:
@@ -405,7 +409,7 @@ def fast_monitor_loop():
 def scanner_loop():
     global scan_cycle_count
     logger.info("=" * 50)
-    logger.info("SCALPER BOT STARTED (v7 - Post‑Exit Blacklist + Price Floor)")
+    logger.info("SCALPER BOT STARTED (v8 - Relaxed Filters + Blacklist)")
     logger.info(f"Paper Mode: {PAPER_MODE}, Target chains: {TARGET_CHAINS}")
     logger.info(f"Filters: Liq>${MIN_LIQUIDITY}, Vol>${MIN_VOLUME}, m5>{MIN_CHANGE}%, Price>${MIN_PRICE_USD}")
     logger.info(f"Trade Size: ${MAX_TRADE_SIZE}, SL: {STOP_LOSS_PCT}%, TP: {TAKE_PROFIT_PCT}%")
@@ -463,7 +467,7 @@ def scanner_loop():
                     break
             logger.info(f"Top momentum tokens: {len(top_pairs)}")
 
-            # 4. Security & Trade
+              # 4. Security & Trade
             for pair in top_pairs:
                 token_addr = pair["baseToken"]["address"]
                 chain = pair.get("_chain", pair.get("chainId"))
