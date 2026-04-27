@@ -33,20 +33,21 @@ STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-1.5"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "3.0"))
 TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "true").lower() == "true"
 TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "2.0"))
-TRAILING_DISTANCE_PCT = float(os.getenv("TRAILING_DISTANCE_PCT", "1.0"))
-MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "0"))          # 0 = disabled
-PULLBACK_ENTRY_PCT = float(os.getenv("PULLBACK_ENTRY_PCT", "0.5"))
+TRAILING_DISTANCE_PCT = float(os.getenv("TRAILING_DISTANCE_PCT", "0.5"))
+MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "0"))
+PULLBACK_ENTRY_PCT = float(os.getenv("PULLBACK_ENTRY_PCT", "0"))
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.3"))
 
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "20000.0"))
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", "10000.0"))
 MIN_CHANGE = float(os.getenv("MIN_CHANGE", "1.0"))
 MIN_AGE_HOURS = float(os.getenv("MIN_AGE_HOURS", "0.0"))
-MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "0.0001"))          # increased to filter dust
+MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "0.0005"))          # raised to filter dust
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 FAST_MONITOR_INTERVAL = int(os.getenv("FAST_MONITOR_INTERVAL", "5"))
 
-BLACKLIST_AFTER_SL_HOURS = float(os.getenv("BLACKLIST_AFTER_SL_HOURS", "3.0"))
+# Blacklist after ANY exit (hours)
+BLACKLIST_AFTER_EXIT_HOURS = float(os.getenv("BLACKLIST_AFTER_EXIT_HOURS", "0.5"))
 
 CHAIN_ID_MAP = {
     "bsc": 56, "ethereum": 1, "polygon": 137, "avalanche": 43114,
@@ -68,7 +69,7 @@ recent: Dict[str, float] = {}
 trade_lock = threading.Lock()
 scan_cycle_count = 0
 
-stop_loss_blacklist: Dict[str, float] = {}
+exit_blacklist: Dict[str, float] = {}  # token_addr -> timestamp of last exit
 
 # ----------------------------------------------------------------------
 # Discord Alerts
@@ -236,25 +237,25 @@ def calculate_pair_score(pair: dict, is_safe: bool) -> float:
         return 0.0
 
 # ----------------------------------------------------------------------
-# Blacklist Management
+# Blacklist Management (after EVERY exit)
 # ----------------------------------------------------------------------
 def is_blacklisted(token_addr: str) -> bool:
-    if token_addr in stop_loss_blacklist:
-        elapsed_hours = (time.time() - stop_loss_blacklist[token_addr]) / 3600
-        if elapsed_hours < BLACKLIST_AFTER_SL_HOURS:
+    if token_addr in exit_blacklist:
+        elapsed_hours = (time.time() - exit_blacklist[token_addr]) / 3600
+        if elapsed_hours < BLACKLIST_AFTER_EXIT_HOURS:
             return True
         else:
-            del stop_loss_blacklist[token_addr]
+            del exit_blacklist[token_addr]
     return False
 
 def add_to_blacklist(token_addr: str):
-    stop_loss_blacklist[token_addr] = time.time()
+    exit_blacklist[token_addr] = time.time()
 
 def clean_blacklist():
     now = time.time()
-    expired = [addr for addr, ts in stop_loss_blacklist.items() if (now - ts) / 3600 >= BLACKLIST_AFTER_SL_HOURS]
+    expired = [addr for addr, ts in exit_blacklist.items() if (now - ts) / 3600 >= BLACKLIST_AFTER_EXIT_HOURS]
     for addr in expired:
-        del stop_loss_blacklist[addr]
+        del exit_blacklist[addr]
 
 # ----------------------------------------------------------------------
 # Paper Trading - Entry
@@ -273,7 +274,7 @@ def simulate_buy(pair: dict) -> Optional[dict]:
         if token_addr in active_trades:
             return None
         if is_blacklisted(token_addr):
-            logger.info(f"Token {token_addr} is blacklisted after stop loss, skipping")
+            logger.info(f"Token {token_addr} is blacklisted after recent exit, skipping")
             return None
 
         try:
@@ -361,9 +362,9 @@ def monitor_positions_fast() -> List[dict]:
                     )
                     closed.append(closed_trade)
 
-                    if exit_reason == "STOP_LOSS":
-                        add_to_blacklist(token_addr)
-                        logger.info(f"Blacklisted {token_addr} for {BLACKLIST_AFTER_SL_HOURS}h after SL")
+                    # Blacklist after EVERY exit – stop re‑entry
+                    add_to_blacklist(token_addr)
+                    logger.info(f"Blacklisted {token_addr} after {exit_reason} (cooldown {BLACKLIST_AFTER_EXIT_HOURS}h)")
 
                     logger.info(f"{exit_reason}: {closed_trade['token']} at {pct_change:.2f}%")
         except Exception as e:
@@ -404,12 +405,12 @@ def fast_monitor_loop():
 def scanner_loop():
     global scan_cycle_count
     logger.info("=" * 50)
-    logger.info("SCALPER BOT STARTED (v6 - Safer Scalping)")
+    logger.info("SCALPER BOT STARTED (v7 - Post‑Exit Blacklist + Price Floor)")
     logger.info(f"Paper Mode: {PAPER_MODE}, Target chains: {TARGET_CHAINS}")
     logger.info(f"Filters: Liq>${MIN_LIQUIDITY}, Vol>${MIN_VOLUME}, m5>{MIN_CHANGE}%, Price>${MIN_PRICE_USD}")
     logger.info(f"Trade Size: ${MAX_TRADE_SIZE}, SL: {STOP_LOSS_PCT}%, TP: {TAKE_PROFIT_PCT}%")
     logger.info(f"Trailing: {TRAILING_STOP_ENABLED} (activate +{TRAILING_ACTIVATION_PCT}%, distance {TRAILING_DISTANCE_PCT}%)")
-    logger.info(f"Blacklist after SL: {BLACKLIST_AFTER_SL_HOURS}h, Monitor interval: {FAST_MONITOR_INTERVAL}s")
+    logger.info(f"Blacklist after exit: {BLACKLIST_AFTER_EXIT_HOURS}h, Monitor interval: {FAST_MONITOR_INTERVAL}s")
     logger.info("=" * 50)
 
     last_clean = time.time()
@@ -551,7 +552,7 @@ def status():
         "active_trades": len(active_trades),
         "trades": trades_list,
         "cycles": scan_cycle_count,
-        "blacklist_count": len(stop_loss_blacklist),
+        "blacklist_count": len(exit_blacklist),
         "server_time": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -579,7 +580,7 @@ def debug():
                 "profit_from_high": round(profit_from_high, 2) if profit_from_high else None,
                 "age_min": round((time.time() - t["timestamp"]) / 60, 1)
             })
-    return jsonify({"trades": trades, "blacklist": list(stop_loss_blacklist.keys())})
+    return jsonify({"trades": trades, "blacklist": list(exit_blacklist.keys())})
 
 # ----------------------------------------------------------------------
 # Entry Point
