@@ -1,2 +1,6 @@
 requests
 flask
+web3
+solana
+solders
+base58
