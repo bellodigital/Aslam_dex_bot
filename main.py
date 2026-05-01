@@ -11,7 +11,7 @@ from typing import Dict, List, Any, Optional
 import requests
 from flask import Flask, jsonify
 from web3 import Web3
-from web3.middleware import geth_poa_middleware
+from web3.middleware.geth_poa import geth_poa_middleware
 
 # Solana imports (graceful fallback if not installed)
 try:
