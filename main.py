@@ -24,7 +24,6 @@ try:
     SOLANA_AVAILABLE = True
 except ImportError:
     SOLANA_AVAILABLE = False
-    # We must define logger before first use; it's already created below, but for safety:
     import logging as _logging
     _logging.getLogger("scalper").warning("Solana libraries not installed. Solana trades will be skipped.")
 
@@ -44,7 +43,7 @@ logger = logging.getLogger("scalper")
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-TARGET_CHAINS = [c.strip().lower() for c in os.getenv("TARGET_CHAINS", "bsc,base,solana").split(",") if c.strip()]
+TARGET_CHAINS = [c.strip().lower() for c in os.getenv("TARGET_CHAINS", "bsc,base,solana,ethereum").split(",") if c.strip()]
 
 MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "100.0"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-1.5"))
@@ -198,7 +197,6 @@ def get_web3(chain: str) -> Optional[Web3]:
         logger.error(f"No RPC URL for {chain}")
         return None
     w3 = Web3(Web3.HTTPProvider(rpc_url))
-    # Inject PoA middleware for BSC and Base
     if chain in ("bsc", "base"):
         w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     if not w3.is_connected():
@@ -551,7 +549,7 @@ def simulate_buy(pair: dict) -> Optional[dict]:
             return None
 
 # ----------------------------------------------------------------------
-# Fast Monitor (with emergency stop)
+# Fast Monitor (with emergency stop and atomic blacklist)
 # ----------------------------------------------------------------------
 def monitor_positions_fast() -> List[dict]:
     closed = []
@@ -600,18 +598,20 @@ def monitor_positions_fast() -> List[dict]:
                 exit_reason = "EMERGENCY_STOP"
 
             if exit_reason:
-                with trade_lock:
-                    closed_trade = active_trades.pop(token_addr, None)
-                if closed_trade is None:
-                    continue   # already closed (prevents duplicate)
-
-                # Live sell
+                # Live sell (outside lock to avoid holding it during network call)
                 if not PAPER_MODE:
                     if chain == "solana":
                         amount_units = int(trade["quantity"] * 10**6)
                     else:
                         amount_units = int(trade["quantity"] * 10**18)
                     sell_token(chain, token_addr, amount_units)
+
+                with trade_lock:
+                    closed_trade = active_trades.pop(token_addr, None)
+                    if closed_trade is None:
+                        continue   # already closed
+                    # Blacklist immediately while holding the lock – prevents re‑entry
+                    add_to_blacklist(token_addr)
 
                 closed_trade["exit_price"] = current_price
                 closed_trade["exit_reason"] = exit_reason
@@ -620,7 +620,6 @@ def monitor_positions_fast() -> List[dict]:
                     trade["quantity"] * current_price - trade["amount_usd"], 2
                 )
                 closed.append(closed_trade)
-                add_to_blacklist(token_addr)
                 logger.info(f"{exit_reason}: {trade['token']} at {pct_change:.2f}%")
         except Exception as e:
             logger.error(f"Monitor error for {trade.get('token','')}: {e}")
@@ -757,3 +756,5 @@ if __name__ == "__main__":
     threading.Thread(target=scanner_loop, daemon=True).start()
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+# ------------------------------------------------------------
