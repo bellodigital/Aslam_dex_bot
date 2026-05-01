@@ -11,7 +11,7 @@ from typing import Dict, List, Any, Optional
 import requests
 from flask import Flask, jsonify
 from web3 import Web3
-from web3.middleware.geth_poa import geth_poa_middleware
+from web3.middleware import ExtraDataToPOAMiddleware  # v7‑compatible
 
 # Solana imports (graceful fallback if not installed)
 try:
@@ -24,8 +24,9 @@ try:
     SOLANA_AVAILABLE = True
 except ImportError:
     SOLANA_AVAILABLE = False
-    logger = logging.getLogger("scalper")
-    logger.warning("Solana libraries not installed. Solana trades will be skipped.")
+    # We must define logger before first use; it's already created below, but for safety:
+    import logging as _logging
+    _logging.getLogger("scalper").warning("Solana libraries not installed. Solana trades will be skipped.")
 
 # ----------------------------------------------------------------------
 # Logging
@@ -43,7 +44,7 @@ logger = logging.getLogger("scalper")
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-TARGET_CHAINS = [c.strip().lower() for c in os.getenv("TARGET_CHAINS", "bsc,base").split(",") if c.strip()]
+TARGET_CHAINS = [c.strip().lower() for c in os.getenv("TARGET_CHAINS", "bsc,base,solana").split(",") if c.strip()]
 
 MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "100.0"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-1.5"))
@@ -194,12 +195,14 @@ def get_web3(chain: str) -> Optional[Web3]:
         return web3_instances[chain]
     rpc_url = RPC_URLS.get(chain)
     if not rpc_url:
+        logger.error(f"No RPC URL for {chain}")
         return None
     w3 = Web3(Web3.HTTPProvider(rpc_url))
+    # Inject PoA middleware for BSC and Base
     if chain in ("bsc", "base"):
-        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     if not w3.is_connected():
-        logger.error(f"Failed to connect to {chain} RPC")
+        logger.error(f"Cannot connect to {chain} RPC")
         return None
     web3_instances[chain] = w3
     return w3
@@ -592,7 +595,7 @@ def monitor_positions_fast() -> List[dict]:
                 if (now - trade["timestamp"]) / 60 >= MAX_HOLD_MINUTES:
                     exit_reason = "MAX_HOLD"
 
-            # EMERGENCY HARD STOP – no matter what
+            # EMERGENCY HARD STOP – no matter what, prevent disasters
             if pct_change <= -5.0 and exit_reason is None:
                 exit_reason = "EMERGENCY_STOP"
 
@@ -753,4 +756,4 @@ if __name__ == "__main__":
     threading.Thread(target=fast_monitor_loop, daemon=True).start()
     threading.Thread(target=scanner_loop, daemon=True).start()
     port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False) 
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
