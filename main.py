@@ -49,21 +49,22 @@ MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "100.0"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-1.5"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "3.0"))
 TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "true").lower() == "true"
-TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "2.0"))
+TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "1.0"))   # earlier lock‑in
 TRAILING_DISTANCE_PCT = float(os.getenv("TRAILING_DISTANCE_PCT", "0.5"))
 MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "0"))
-PULLBACK_ENTRY_PCT = float(os.getenv("PULLBACK_ENTRY_PCT", "0"))
+PULLBACK_ENTRY_PCT = float(os.getenv("PULLBACK_ENTRY_PCT", "0.3"))  # re‑enabled
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.3"))
 SWAP_SLIPPAGE_PCT = float(os.getenv("SWAP_SLIPPAGE_PCT", "1.0"))
 
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "50000.0"))
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", "15000.0"))
-MIN_CHANGE = float(os.getenv("MIN_CHANGE", "1.0"))
-MIN_AGE_HOURS = float(os.getenv("MIN_AGE_HOURS", "0.0"))
+# Stronger filters – fewer, better trades
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "100000.0"))
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "20000.0"))
+MIN_CHANGE = float(os.getenv("MIN_CHANGE", "2.0"))       # higher momentum threshold
+MIN_AGE_HOURS = float(os.getenv("MIN_AGE_HOURS", "1.0")) # skip ultra‑new tokens
 MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "0.0001"))
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 FAST_MONITOR_INTERVAL = int(os.getenv("FAST_MONITOR_INTERVAL", "5"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "70.0"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "80.0"))        # only the best
 
 BLACKLIST_AFTER_EXIT_HOURS = float(os.getenv("BLACKLIST_AFTER_EXIT_HOURS", "4.0"))
 
@@ -408,7 +409,7 @@ def fetch_pair_price(chain: str, pair_address: str) -> Optional[float]:
         return None
 
 # ----------------------------------------------------------------------
-# Filtering
+# Filtering (with new m1 > 0 check)
 # ----------------------------------------------------------------------
 def filter_pairs(pairs: List[dict]) -> List[dict]:
     now_ms = int(time.time() * 1000)
@@ -424,15 +425,20 @@ def filter_pairs(pairs: List[dict]) -> List[dict]:
             liq = float(pair.get("liquidity", {}).get("usd", 0))
             vol = float(pair.get("volume", {}).get("h24", 0))
             m5 = float(pair.get("priceChange", {}).get("m5", 0))
+            m1 = float(pair.get("priceChange", {}).get("m1", 0))
             created = int(pair.get("pairCreatedAt", 0))
             age_hours = (now_ms - created) / 3600000 if created else 0
             if liq < MIN_LIQUIDITY or vol < MIN_VOLUME or m5 < MIN_CHANGE:
                 continue
             if MIN_AGE_HOURS > 0 and age_hours < MIN_AGE_HOURS:
                 continue
+            # NEW: only enter if the token is still rising over the last 1 minute
+            if m1 <= 0:
+                continue
             pair["_liq"] = liq
             pair["_vol"] = vol
             pair["_m5"] = m5
+            pair["_m1"] = m1
             pair["_age_hours"] = age_hours
             pair["_price"] = price
             pair["_chain"] = chain
@@ -442,8 +448,25 @@ def filter_pairs(pairs: List[dict]) -> List[dict]:
     logger.info(f"Filter summary: {len(pairs)} input, {len(valid)} passed for {TARGET_CHAINS}")
     return valid
 
+def is_pullback_entry(pair: dict) -> bool:
+    if PULLBACK_ENTRY_PCT <= 0:
+        return True
+    try:
+        price = pair.get("_price", 0)
+        m5 = pair.get("_m5", 0)
+        m1 = pair.get("_m1", 0)
+        if m5 <= 0:
+            return False
+        if m1 <= 0:                   # already filtered, but double‑check
+            return False
+        estimated_high = price / (1 + m5 / 100)
+        pullback_target = estimated_high * (1 - PULLBACK_ENTRY_PCT / 100)
+        return price <= pullback_target
+    except:
+        return True
+
 # ----------------------------------------------------------------------
-# Security & Score
+# Security & Score (m1 now included)
 # ----------------------------------------------------------------------
 def get_token_security(chain_id: int, token_address: str) -> Optional[dict]:
     url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
@@ -471,11 +494,13 @@ def calculate_pair_score(pair: dict, is_safe: bool) -> float:
         liq = pair.get("_liq", 0)
         vol = pair.get("_vol", 0)
         m5 = pair.get("_m5", 0)
-        liq_score = min(liq / 100000, 1) * 30
-        vol_score = min(vol / 50000, 1) * 20
-        momentum_score = min(abs(m5) / 10, 1) * 30
+        m1 = pair.get("_m1", 0)
+        liq_score = min(liq / 100000, 1) * 20        # slightly reduced to give m1 room
+        vol_score = min(vol / 50000, 1) * 15
+        momentum_score = min(abs(m5) / 10, 1) * 25
+        m1_score = min(max(m1, 0) / 5, 1) * 20       # up to +5% 1-min gives full score
         safety_score = 20 if is_safe else 0
-        return round(liq_score + vol_score + momentum_score + safety_score, 2)
+        return round(liq_score + vol_score + momentum_score + m1_score + safety_score, 2)
     except:
         return 0.0
 
@@ -574,13 +599,11 @@ def monitor_positions_fast() -> List[dict]:
 
             exit_reason = None
 
-            # Normal TP/SL
             if pct_change >= TAKE_PROFIT_PCT:
                 exit_reason = "TAKE_PROFIT"
             elif pct_change <= STOP_LOSS_PCT:
                 exit_reason = "STOP_LOSS"
 
-            # Trailing
             if exit_reason is None and TRAILING_STOP_ENABLED:
                 highest = trade.get("highest_price", entry_price)
                 if ((highest - entry_price) / entry_price) * 100 >= TRAILING_ACTIVATION_PCT:
@@ -588,17 +611,14 @@ def monitor_positions_fast() -> List[dict]:
                     if current_price <= trailing_stop:
                         exit_reason = "TRAILING_STOP"
 
-            # Max Hold
             if exit_reason is None and MAX_HOLD_MINUTES > 0:
                 if (now - trade["timestamp"]) / 60 >= MAX_HOLD_MINUTES:
                     exit_reason = "MAX_HOLD"
 
-            # EMERGENCY HARD STOP – no matter what, prevent disasters
             if pct_change <= -5.0 and exit_reason is None:
                 exit_reason = "EMERGENCY_STOP"
 
             if exit_reason:
-                # Live sell (outside lock to avoid holding it during network call)
                 if not PAPER_MODE:
                     if chain == "solana":
                         amount_units = int(trade["quantity"] * 10**6)
@@ -609,8 +629,7 @@ def monitor_positions_fast() -> List[dict]:
                 with trade_lock:
                     closed_trade = active_trades.pop(token_addr, None)
                     if closed_trade is None:
-                        continue   # already closed
-                    # Blacklist immediately while holding the lock – prevents re‑entry
+                        continue
                     add_to_blacklist(token_addr)
 
                 closed_trade["exit_price"] = current_price
@@ -653,7 +672,7 @@ SEARCH_TERMS = ["pepe", "shib", "doge", "elon", "floki", "moon", "inu", "baby", 
 
 def scanner_loop():
     global scan_cycle_count
-    logger.info(f"SCALPER v10 – {TARGET_CHAINS} – Paper:{PAPER_MODE}")
+    logger.info(f"SCALPER v11 – Ultra‑Selective – {TARGET_CHAINS} – Paper:{PAPER_MODE}")
     last_clean = time.time()
     while True:
         try:
@@ -680,6 +699,11 @@ def scanner_loop():
                     time.sleep(0.2)
 
             valid = filter_pairs(all_pairs)
+            if PULLBACK_ENTRY_PCT > 0:
+                before = len(valid)
+                valid = [p for p in valid if is_pullback_entry(p)]
+                logger.info(f"Pullback filter: {before} → {len(valid)} candidates")
+
             valid.sort(key=lambda x: x.get("_m5", 0), reverse=True)
             top = []
             seen_tokens = set()
@@ -756,5 +780,3 @@ if __name__ == "__main__":
     threading.Thread(target=scanner_loop, daemon=True).start()
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
-# ------------------------------------------------------------
