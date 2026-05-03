@@ -120,77 +120,79 @@ halt_trading = False
 def filter_pairs(pairs: List[dict]) -> List[dict]:
     now_ms = int(time.time() * 1000)
     valid = []
-    # Rejection counters
-    rejects = {
-        "chain": 0, "price": 0, "liq": 0, "vol": 0, "m5": 0,
-        "age": 0, "m1_neg": 0, "vol_accel": 0
-    }
+    # rejection counters
+    rej_chain     = 0
+    rej_price     = 0
+    rej_liq       = 0
+    rej_vol       = 0
+    rej_m5        = 0
+    rej_age       = 0
+    rej_m1        = 0
+    rej_vol_accel = 0
+
     for pair in pairs:
         try:
             chain = pair.get("chainId")
             if chain not in TARGET_CHAINS:
-                rejects["chain"] += 1
+                rej_chain += 1
                 continue
+
             price = float(pair.get("priceUsd", 0))
             if price < MIN_PRICE_USD:
-                rejects["price"] += 1
+                rej_price += 1
                 continue
+
             liq = float(pair.get("liquidity", {}).get("usd", 0))
             if liq < MIN_LIQUIDITY:
-                rejects["liq"] += 1
+                rej_liq += 1
                 continue
+
             vol = float(pair.get("volume", {}).get("h24", 0))
             if vol < MIN_VOLUME:
-                rejects["vol"] += 1
+                rej_vol += 1
                 continue
+
             m5 = float(pair.get("priceChange", {}).get("m5", 0))
             if m5 < MIN_CHANGE:
-                rejects["m5"] += 1
+                rej_m5 += 1
                 continue
+
+            m1 = float(pair.get("priceChange", {}).get("m1", 0))
+            if m1 <= 0:
+                rej_m1 += 1
+                continue
+
             created = int(pair.get("pairCreatedAt", 0))
             age_hours = (now_ms - created) / 3600000 if created else 0
             if MIN_AGE_HOURS > 0 and age_hours < MIN_AGE_HOURS:
-                rejects["age"] += 1
-                continue
-            m1 = float(pair.get("priceChange", {}).get("m1", 0))
-            if m1 <= 0:                     # still require positive 1-min momentum
-                rejects["m1_neg"] += 1
+                rej_age += 1
                 continue
 
-            # Volume acceleration (m5 volume vs h1 average) – DISABLED for now, just logs
+            # Volume acceleration
             vol_m5 = float(pair.get("volume", {}).get("m5", 0))
             vol_h1 = float(pair.get("volume", {}).get("h1", 0))
             if vol_h1 > 0 and vol_m5 < (vol_h1 / 12) * 1.5:
-                rejects["vol_accel"] += 1
-                # continue   <-- COMMENTED OUT to allow trades
-                # We'll still count it but not reject
-                pass
+                rej_vol_accel += 1
+                continue
 
             pair["_liq"] = liq
             pair["_vol"] = vol
-            pair["_m5"] = m5
-            pair["_m1"] = m1
+            pair["_m5"]  = m5
+            pair["_m1"]  = m1
+            pair["_h1"]  = float(pair.get("priceChange", {}).get("h1", 0))
             pair["_age_hours"] = age_hours
             pair["_price"] = price
             pair["_chain"] = chain
             valid.append(pair)
-        except:
+
+        except Exception as e:
+            logger.debug(f"Filter error: {e}")
             continue
 
-    # Print rejection summary
-    logger.info(f"Filter rejection counts: {rejects}")
-    logger.info(f"Filter summary: {len(pairs)} input, {len(valid)} passed for {TARGET_CHAINS}")
+    # --- DETAILED REJECTION LOG ---
+    logger.info(
+        f"Filter summary: {len(pairs)} in, {len(valid)} out | "
+        f"Rejections → chain:{rej_chain}, price:{rej_price}, liq:{rej_liq}, vol:{rej_vol}, "
+        f"m5:{rej_m5}, m1:{rej_m1}, age:{rej_age}, vol_accel:{rej_vol_accel}"
+    )
     return valid
-
-# ----------------------------------------------------------------------
-# Rest of the code: is_pullback_entry (disabled), confirm_momentum, calculate_pair_score, etc.
-# Use exactly the same functions from the latest full v12 code, but with the relaxed defaults.
-# ----------------------------------------------------------------------
-# (Copy all remaining functions from the previous v12 relaxed code.)
-# For brevity, I'll not paste them, but they must be included unchanged except filter_pairs above.
-# ----------------------------------------------------------------------
-
-# At the very bottom, the entry point and Flask app remain the same.
-
-if __name__ == "__main__":
-    # ... same as before
