@@ -1,6 +1,7 @@
-requests
-flask
-web3
-solana
-solders
-base58
+requests>=2.31.0
+flask>=3.0.0
+web3>=6.15.0
+solana>=0.34.0
+solders>=0.21.0
+base58>=2.1.1
+
