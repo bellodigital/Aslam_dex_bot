@@ -549,3 +549,408 @@ def confirm_momentum(pair, required=MOMENTUM_REQUIRED):
     if len(history) < required:
         return False
     return all(v > 0 for _, v in history[-required:])
+ENTRY ─────────────────────────────────────────────────────────────────
+def simulate_buy(pair, score):
+    token_addr = pair.get("baseToken", {}).get("address", "").lower()
+    pair_addr  = pair.get("pairAddress", "")
+    chain      = pair.get("_chain", pair.get("chainId"))
+
+    if not token_addr or not pair_addr:
+        return None
+
+    now = time.time()
+    with trade_lock:
+        if len(active_trades) >= MAX_OPEN_TRADES:
+            return None
+        if token_addr in recent and (now - recent[token_addr]) < 1800:
+            return None
+        if token_addr in active_trades:
+            return None
+        if is_blacklisted(token_addr):
+            return None
+        try:
+            price = pair.get("_price", float(pair.get("priceUsd", 0) or 0))
+            if price <= 0:
+                return None
+            entry_price = price * (1 + SLIPPAGE_PCT / 100)
+            trade_usd   = MAX_TRADE_SIZE
+            quantity    = trade_usd / entry_price
+            if not PAPER_MODE:
+                if not buy_token(chain, token_addr, trade_usd):
+                    logger.error(f"Buy failed: {pair['baseToken']['symbol']}")
+                    return None
+            trade = {
+                "token":          pair["baseToken"]["symbol"],
+                "token_address":  token_addr,
+                "pair_address":   pair_addr,
+                "chain":          chain,
+                "entry_price":    entry_price,
+                "amount_usd":     trade_usd,
+                "quantity":       quantity,
+                "remaining_qty":  quantity,
+                "total_spent":    trade_usd,
+                "partial_profit": 0.0,
+                "scaled_out":     False,
+                "tp1_price":      None,
+                "timestamp":      now,
+                "highest_price":  entry_price,
+                "score":          score,
+                "m5_at_entry":    pair.get("_m5", 0),
+                "m1_at_entry":    pair.get("_m1", 0),
+            }
+            active_trades[token_addr] = trade
+            recent[token_addr] = now
+            logger.info(
+                f"✅ BUY: {trade['token']} @ ${entry_price:.8f} | "
+                f"Score:{score} m5:{pair.get('_m5',0):.1f}% m1:{pair.get('_m1',0):.1f}% | Chain:{chain}"
+            )
+            return trade
+        except Exception as e:
+            logger.error(f"Entry error: {e}")
+            return None
+
+# ── MONITOR ───────────────────────────────────────────────────────────────
+def monitor_positions_fast():
+    global tp_hits, sl_hits, trailing_hits, timeout_exits, total_exits
+    global daily_pnl_usd, halt_trading, partial_tp_hits
+    global session_best_pct, session_worst_pct
+
+    closed = []
+    now = time.time()
+
+    with trade_lock:
+        items = list(active_trades.items())
+
+    for token_addr, trade in items:
+        try:
+            current_price = fetch_pair_price(trade["chain"], trade["pair_address"])
+            if not current_price or current_price <= 0:
+                continue
+
+            entry_price = trade["entry_price"]
+            pct_change  = ((current_price - entry_price) / entry_price) * 100
+
+            with trade_lock:
+                if token_addr in active_trades:
+                    if current_price > active_trades[token_addr]["highest_price"]:
+                        active_trades[token_addr]["highest_price"] = current_price
+                    trade = active_trades[token_addr]
+
+            # Partial TP
+            if not trade.get("scaled_out") and pct_change >= PARTIAL_TP_PCT:
+                partial_qty    = trade["quantity"] * PARTIAL_TP_RATIO
+                partial_profit = partial_qty * current_price - partial_qty * entry_price
+                if not PAPER_MODE:
+                    units = int(partial_qty * (10**6 if trade["chain"] == "solana" else 10**18))
+                    sell_token(trade["chain"], token_addr, units)
+                with trade_lock:
+                    if token_addr in active_trades:
+                        active_trades[token_addr]["scaled_out"]     = True
+                        active_trades[token_addr]["tp1_price"]      = current_price
+                        active_trades[token_addr]["remaining_qty"]  -= partial_qty
+                        active_trades[token_addr]["partial_profit"] += partial_profit
+                        trade = active_trades[token_addr]
+                partial_tp_hits += 1
+                logger.info(f"📈 PARTIAL TP: {trade['token']} +{pct_change:.2f}%")
+                send_discord_alert(f"Partial TP: {trade['token']} +{pct_change:.2f}%")
+                continue
+
+            exit_reason = None
+            if pct_change >= TAKE_PROFIT_PCT:
+                exit_reason = "TAKE_PROFIT"
+            elif pct_change <= STOP_LOSS_PCT:
+                exit_reason = "STOP_LOSS"
+            elif pct_change <= EMERGENCY_STOP_PCT:
+                exit_reason = "EMERGENCY_STOP"
+
+            if exit_reason is None and TRAILING_STOP_ENABLED and trade.get("scaled_out"):
+                highest = trade.get("highest_price", entry_price)
+                profit_from_high = ((highest - entry_price) / entry_price) * 100
+                if profit_from_high >= TRAILING_ACTIVATION_PCT:
+                    trail_stop = highest * (1 - TRAILING_DISTANCE_PCT / 100)
+                    if current_price <= trail_stop:
+                        exit_reason = "TRAILING_STOP"
+
+            if exit_reason is None and MAX_HOLD_MINUTES > 0:
+                held_minutes = (now - trade["timestamp"]) / 60
+                if held_minutes >= MAX_HOLD_MINUTES:
+                    exit_reason = "MAX_HOLD"
+
+            if exit_reason:
+                if not PAPER_MODE:
+                    sell_qty = trade.get("remaining_qty", trade["quantity"])
+                    units = int(sell_qty * (10**6 if trade["chain"] == "solana" else 10**18))
+                    sell_token(trade["chain"], token_addr, units)
+
+                with trade_lock:
+                    closed_trade = active_trades.pop(token_addr, None)
+                if closed_trade is None:
+                    continue
+
+                add_to_blacklist(token_addr)
+                remaining_qty  = closed_trade.get("remaining_qty", closed_trade["quantity"])
+                partial_profit = closed_trade.get("partial_profit", 0.0)
+                final_profit   = remaining_qty * current_price - remaining_qty * entry_price
+                total_pnl_usd  = partial_profit + final_profit
+                total_pnl_pct  = (total_pnl_usd / closed_trade["total_spent"]) * 100 if closed_trade["total_spent"] else 0
+
+                closed_trade.update({
+                    "exit_price":   current_price,
+                    "exit_reason":  exit_reason,
+                    "pnl_pct":      round(total_pnl_pct, 2),
+                    "pnl_usd":      round(total_pnl_usd, 2),
+                    "hold_minutes": round((now - closed_trade["timestamp"]) / 60, 1),
+                })
+                closed.append(closed_trade)
+
+                total_exits   += 1
+                daily_pnl_usd += total_pnl_usd
+
+                if total_pnl_pct > session_best_pct:
+                    session_best_pct = total_pnl_pct
+                if total_pnl_pct < session_worst_pct:
+                    session_worst_pct = total_pnl_pct
+
+                if exit_reason in ("TAKE_PROFIT", "TRAILING_STOP"):
+                    tp_hits += 1
+                    if exit_reason == "TRAILING_STOP":
+                        trailing_hits += 1
+                elif "STOP" in exit_reason:
+                    sl_hits += 1
+                elif exit_reason == "MAX_HOLD":
+                    timeout_exits += 1
+
+                win_rate = (tp_hits / total_exits * 100) if total_exits else 0
+                emoji = "🟢" if total_pnl_usd >= 0 else "🔴"
+                logger.info(
+                    f"{emoji} {exit_reason}: {closed_trade['token']} "
+                    f"PNL {total_pnl_pct:.2f}% (${total_pnl_usd:.2f}) | "
+                    f"WR:{win_rate:.1f}% [{tp_hits}TP/{sl_hits}SL/{timeout_exits}TO/{total_exits}] | "
+                    f"Daily:${daily_pnl_usd:.2f}"
+                )
+                if daily_pnl_usd <= -abs(MAX_DAILY_LOSS_USD):
+                    logger.warning("🚨 Daily loss limit! Halting entries.")
+                    halt_trading = True
+
+        except Exception as e:
+            logger.error(f"Monitor error [{trade.get('token','?')}]: {e}")
+
+    return closed
+
+def fast_monitor_loop():
+    logger.info(f"Monitor thread started (interval={FAST_MONITOR_INTERVAL}s)")
+    while True:
+        try:
+            closed = monitor_positions_fast()
+            for ct in closed:
+                win_rate = f"{tp_hits}/{total_exits} ({tp_hits/total_exits*100:.1f}%)" if total_exits else "N/A"
+                embed = {
+                    "title": f"{'🟢' if ct['pnl_usd'] >= 0 else '🔴'} {ct['exit_reason']}: {ct['token']}",
+                    "color": 0x00FF00 if ct["pnl_usd"] >= 0 else 0xFF0000,
+                    "fields": [
+                        {"name": "Chain",     "value": ct["chain"],                    "inline": True},
+                        {"name": "Entry",     "value": f"${ct['entry_price']:.8f}",    "inline": True},
+                        {"name": "Exit",      "value": f"${ct['exit_price']:.8f}",     "inline": True},
+                        {"name": "P&L %",     "value": f"{ct['pnl_pct']}%",            "inline": True},
+                        {"name": "P&L $",     "value": f"${ct['pnl_usd']:.2f}",        "inline": True},
+                        {"name": "Hold",      "value": f"{ct['hold_minutes']}m",       "inline": True},
+                        {"name": "Win Rate",  "value": win_rate,                       "inline": False},
+                        {"name": "Daily P&L", "value": f"${daily_pnl_usd:.2f}",        "inline": True},
+                    ],
+                }
+                send_discord_alert("Trade closed", embed)
+        except Exception as e:
+            logger.error(f"Monitor loop error: {e}")
+        time.sleep(FAST_MONITOR_INTERVAL)
+
+# ── SCANNER ───────────────────────────────────────────────────────────────
+SEARCH_TERMS = [
+    "pepe", "shib", "doge", "floki", "inu", "baby", "moon", "cat",
+    "ai", "gpt", "bot", "based", "chad", "pump", "elon", "king", "rocket", "safe",
+]
+
+def scanner_loop():
+    global scan_cycle_count, daily_pnl_usd, daily_reset_time, halt_trading
+    logger.info(
+        f"🚀 DEX SCALPER PRO v4 | Chains:{TARGET_CHAINS} | "
+        f"Paper:{PAPER_MODE} | TP:{TAKE_PROFIT_PCT}% SL:{STOP_LOSS_PCT}%"
+    )
+    last_clean = time.time()
+
+    while True:
+        try:
+            if time.time() - daily_reset_time > 86400:
+                daily_pnl_usd    = 0.0
+                halt_trading     = False
+                daily_reset_time = time.time()
+                logger.info("📅 Daily P&L reset.")
+
+            if halt_trading:
+                logger.warning("⏸ Halted — daily loss limit.")
+                time.sleep(SCAN_INTERVAL_SECONDS)
+                continue
+
+            scan_cycle_count += 1
+            all_pairs = []
+            seen_addresses = set()
+
+            boosted = fetch_boosted_tokens("latest")
+            for b in [x for x in boosted if x.get("chainId", "").lower() in TARGET_CHAINS][:25]:
+                if b.get("tokenAddress"):
+                    pair = fetch_pair_by_address(b["tokenAddress"])
+                    if pair and pair.get("pairAddress") not in seen_addresses:
+                        seen_addresses.add(pair["pairAddress"])
+                        all_pairs.append(pair)
+                    time.sleep(0.15)
+
+            if len(all_pairs) < 40:
+                for term in SEARCH_TERMS:
+                    for p in fetch_dex_pairs(term):
+                        addr = p.get("pairAddress")
+                        if addr and addr not in seen_addresses:
+                            seen_addresses.add(addr)
+                            all_pairs.append(p)
+                    time.sleep(0.2)
+                    if len(all_pairs) >= 80:
+                        break
+
+            valid = filter_pairs(all_pairs)
+            valid.sort(
+                key=lambda x: x.get("_m5", 0) * (x.get("_vol", 0) / max(x.get("_liq", 1), 1)),
+                reverse=True
+            )
+
+            top = []
+            seen_tokens = set()
+            for p in valid:
+                addr = p.get("baseToken", {}).get("address", "").lower()
+                if addr and addr not in seen_tokens:
+                    seen_tokens.add(addr)
+                    top.append(p)
+                if len(top) >= 15:
+                    break
+
+            for pair in top:
+                if halt_trading or len(active_trades) >= MAX_OPEN_TRADES:
+                    break
+
+                token_addr = pair["baseToken"]["address"]
+                chain      = pair["_chain"]
+                numeric_id = CHAIN_ID_MAP.get(chain)
+                if not numeric_id:
+                    continue
+
+                security = get_token_security(numeric_id, token_addr)
+                safe, reason = is_token_safe(security)
+                if not safe:
+                    logger.info(f"⛔ UNSAFE: {pair['baseToken']['symbol']} — {reason}")
+                    continue
+
+                score = calculate_pair_score(pair, safe)
+                if score < MIN_SCORE:
+                    logger.info(f"Score {score:.1f} < {MIN_SCORE} — skip {pair['baseToken']['symbol']}")
+                    continue
+
+                if not confirm_momentum(pair):
+                    logger.info(f"No momentum — skip {pair['baseToken']['symbol']}")
+                    continue
+
+                trade = simulate_buy(pair, score)
+                if trade:
+                    send_discord_alert("New trade", {
+                        "title": f"🟡 BUY: {trade['token']} on {chain}",
+                        "color": 0xFFFF00,
+                        "fields": [
+                            {"name": "Price",  "value": f"${trade['entry_price']:.8f}", "inline": True},
+                            {"name": "Score",  "value": str(score),                      "inline": True},
+                            {"name": "M5",     "value": f"{pair['_m5']:.2f}%",           "inline": True},
+                            {"name": "M1",     "value": f"{pair['_m1']:.2f}%",           "inline": True},
+                        ],
+                    })
+                time.sleep(0.5)
+
+            if time.time() - last_clean > 600:
+                clean_blacklist()
+                stale = [a for a, h in list(momentum_history.items())
+                         if h and time.time() - h[-1][0] > 3600]
+                for a in stale:
+                    momentum_history.pop(a, None)
+                last_clean = time.time()
+
+            if scan_cycle_count % 5 == 0 and total_exits > 0:
+                wr = tp_hits / total_exits * 100
+                logger.info(
+                    f"📊 WR:{wr:.1f}% TP:{tp_hits} SL:{sl_hits} "
+                    f"Trail:{trailing_hits} TO:{timeout_exits} Total:{total_exits} | "
+                    f"Daily:${daily_pnl_usd:.2f} | Best:{session_best_pct:.1f}% Worst:{session_worst_pct:.1f}%"
+                )
+
+            time.sleep(SCAN_INTERVAL_SECONDS)
+
+        except Exception as e:
+            logger.error(f"Scanner error: {e}", exc_info=True)
+            time.sleep(30)
+
+# ── FLASK ─────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
+@app.route("/")
+def status():
+    wr = f"{tp_hits}/{total_exits} ({tp_hits/total_exits*100:.1f}%)" if total_exits else "N/A"
+    return jsonify({
+        "status":        "running",
+        "paper_mode":    PAPER_MODE,
+        "open_trades":   len(active_trades),
+        "win_rate":      wr,
+        "tp_hits":       tp_hits,
+        "sl_hits":       sl_hits,
+        "trailing_hits": trailing_hits,
+        "timeout_exits": timeout_exits,
+        "total_exits":   total_exits,
+        "daily_pnl":     round(daily_pnl_usd, 2),
+        "halted":        halt_trading,
+        "scan_cycle":    scan_cycle_count,
+        "best_trade":    f"{session_best_pct:.2f}%",
+        "worst_trade":   f"{session_worst_pct:.2f}%",
+        "active_trades": {
+            addr: {
+                "token":      t["token"],
+                "chain":      t["chain"],
+                "hold_min":   round((time.time() - t["timestamp"]) / 60, 1),
+                "scaled_out": t["scaled_out"],
+            }
+            for addr, t in active_trades.items()
+        },
+    })
+
+@app.route("/trades")
+def trades():
+    return jsonify(list(active_trades.values()))
+
+# ── MAIN ──────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    if not DISCORD_WEBHOOK_URL:
+        logger.warning("⚠️  No Discord webhook set.")
+    if not PAPER_MODE:
+        logger.warning("🔴 LIVE MODE — real funds at risk!")
+        if "solana" in TARGET_CHAINS and SOLANA_PRIVATE_KEY:
+            if init_solana():
+                logger.info("✅ Solana ready")
+            else:
+                logger.error("❌ Solana init failed")
+        if not WALLET_PRIVATE_KEY and any(c != "solana" for c in TARGET_CHAINS):
+            logger.error("❌ EVM private key required for live mode")
+            sys.exit(1)
+    else:
+        logger.info("📄 PAPER MODE active")
+
+    threading.Thread(target=fast_monitor_loop, daemon=True).start()
+    threading.Thread(target=scanner_loop, daemon=True).start()
+
+    port = int(os.getenv("PORT", "8080"))
+    logger.info(f"🌐 Flask on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
